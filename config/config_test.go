@@ -201,6 +201,12 @@ func TestConfigValidate_table(t *testing.T) {
 			true,
 			"cannot contain interp",
 		},
+		{
+			"nested types in variable default",
+			"validate-var-nested",
+			false,
+			"",
+		},
 	}
 
 	for i, tc := range cases {
@@ -563,6 +569,13 @@ func TestConfigValidate_varDefaultInterpolate(t *testing.T) {
 	c := testConfig(t, "validate-var-default-interpolate")
 	if err := c.Validate(); err == nil {
 		t.Fatal("should not be valid")
+	}
+}
+
+func TestConfigValidate_varDefaultInterpolateEscaped(t *testing.T) {
+	c := testConfig(t, "validate-var-default-interpolate-escaped")
+	if err := c.Validate(); err != nil {
+		t.Fatalf("should be valid, but got err: %s", err)
 	}
 }
 
