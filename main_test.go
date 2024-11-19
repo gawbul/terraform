@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package main
 
 import (
@@ -6,21 +9,24 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/mitchellh/cli"
+	"github.com/hashicorp/cli"
 )
 
 func TestMain_cliArgsFromEnv(t *testing.T) {
-	// Setup the state. This test really messes with the environment and
+	// Set up the state. This test really messes with the environment and
 	// global state so we set things up to be restored.
 
 	// Restore original CLI args
 	oldArgs := os.Args
 	defer func() { os.Args = oldArgs }()
 
-	// Setup test command and restore that
+	// Set up test command and restore that
+	Commands = make(map[string]cli.CommandFactory)
+	defer func() {
+		Commands = nil
+	}()
 	testCommandName := "unit-test-cli-args"
 	testCommand := &testCommandCLI{}
-	defer func() { delete(Commands, testCommandName) }()
 	Commands[testCommandName] = func() (cli.Command, error) {
 		return testCommand, nil
 	}
@@ -28,7 +34,7 @@ func TestMain_cliArgsFromEnv(t *testing.T) {
 	cases := []struct {
 		Name     string
 		Args     []string
-		Value    string
+		EnvValue string
 		Expected []string
 		Err      bool
 	}{
@@ -43,8 +49,8 @@ func TestMain_cliArgsFromEnv(t *testing.T) {
 		{
 			"both env var and CLI",
 			[]string{testCommandName, "foo", "bar"},
-			"-foo bar",
-			[]string{"-foo", "bar", "foo", "bar"},
+			"-foo baz",
+			[]string{"-foo", "baz", "foo", "bar"},
 			false,
 		},
 
@@ -105,21 +111,38 @@ func TestMain_cliArgsFromEnv(t *testing.T) {
 			[]string{"-foo", "'bar baz'", "foo"},
 			false,
 		},
+
+		{
+			"backticks taken literally",
+			// The shellwords library we use to parse the environment variables
+			// has the option to automatically execute commands written in
+			// backticks. This test is here to make sure we don't accidentally
+			// enable that.
+			[]string{testCommandName, "foo"},
+			"-foo `echo nope`",
+			[]string{"-foo", "`echo nope`", "foo"},
+			false,
+		},
+
+		{
+			"no nested environment variable expansion",
+			// The shellwords library we use to parse the environment variables
+			// has the option to automatically expand sequences that appear
+			// to be environment variable interpolations. This test is here to
+			// make sure we don't accidentally enable that.
+			[]string{testCommandName, "foo"},
+			"-foo $OTHER_ENV",
+			[]string{"-foo", "$OTHER_ENV", "foo"},
+			false,
+		},
 	}
 
 	for i, tc := range cases {
 		t.Run(fmt.Sprintf("%d-%s", i, tc.Name), func(t *testing.T) {
-			os.Unsetenv(EnvCLI)
-			defer os.Unsetenv(EnvCLI)
+			t.Setenv(EnvCLI, tc.EnvValue)
+			t.Setenv("OTHER_ENV", "placeholder")
 
-			// Set the env var value
-			if tc.Value != "" {
-				if err := os.Setenv(EnvCLI, tc.Value); err != nil {
-					t.Fatalf("err: %s", err)
-				}
-			}
-
-			// Setup the args
+			// Set up the args
 			args := make([]string, len(tc.Args)+1)
 			args[0] = oldArgs[0] // process name
 			copy(args[1:], tc.Args)
@@ -127,7 +150,7 @@ func TestMain_cliArgsFromEnv(t *testing.T) {
 			// Run it!
 			os.Args = args
 			testCommand.Args = nil
-			exit := wrappedMain()
+			exit := realMain()
 			if (exit != 0) != tc.Err {
 				t.Fatalf("bad: %d", exit)
 			}
@@ -137,7 +160,7 @@ func TestMain_cliArgsFromEnv(t *testing.T) {
 
 			// Verify
 			if !reflect.DeepEqual(testCommand.Args, tc.Expected) {
-				t.Fatalf("bad: %#v", testCommand.Args)
+				t.Fatalf("expected args %#v but got %#v", tc.Expected, testCommand.Args)
 			}
 		})
 	}
@@ -149,6 +172,12 @@ func TestMain_cliArgsFromEnvAdvanced(t *testing.T) {
 	// Restore original CLI args
 	oldArgs := os.Args
 	defer func() { os.Args = oldArgs }()
+
+	// Set up test command and restore that
+	Commands = make(map[string]cli.CommandFactory)
+	defer func() {
+		Commands = nil
+	}()
 
 	cases := []struct {
 		Name     string
@@ -202,7 +231,7 @@ func TestMain_cliArgsFromEnvAdvanced(t *testing.T) {
 
 	for i, tc := range cases {
 		t.Run(fmt.Sprintf("%d-%s", i, tc.Name), func(t *testing.T) {
-			// Setup test command and restore that
+			// Set up test command and restore that
 			testCommandName := tc.Command
 			testCommand := &testCommandCLI{}
 			defer func() { delete(Commands, testCommandName) }()
@@ -220,7 +249,7 @@ func TestMain_cliArgsFromEnvAdvanced(t *testing.T) {
 				}
 			}
 
-			// Setup the args
+			// Set up the args
 			args := make([]string, len(tc.Args)+1)
 			args[0] = oldArgs[0] // process name
 			copy(args[1:], tc.Args)
@@ -228,9 +257,9 @@ func TestMain_cliArgsFromEnvAdvanced(t *testing.T) {
 			// Run it!
 			os.Args = args
 			testCommand.Args = nil
-			exit := wrappedMain()
+			exit := realMain()
 			if (exit != 0) != tc.Err {
-				t.Fatalf("bad: %d", exit)
+				t.Fatalf("unexpected exit status %d; want 0", exit)
 			}
 			if tc.Err {
 				return
@@ -241,6 +270,34 @@ func TestMain_cliArgsFromEnvAdvanced(t *testing.T) {
 				t.Fatalf("bad: %#v", testCommand.Args)
 			}
 		})
+	}
+}
+
+// verify that we output valid autocomplete results
+func TestMain_autoComplete(t *testing.T) {
+	// Restore original CLI args
+	oldArgs := os.Args
+	defer func() { os.Args = oldArgs }()
+
+	// Set up test command and restore that
+	Commands = make(map[string]cli.CommandFactory)
+	defer func() {
+		Commands = nil
+	}()
+
+	// Set up test command and restore that
+	Commands["foo"] = func() (cli.Command, error) {
+		return &testCommandCLI{}, nil
+	}
+
+	os.Setenv("COMP_LINE", "terraform versio")
+	defer os.Unsetenv("COMP_LINE")
+
+	// Run it!
+	os.Args = []string{"terraform", "terraform", "versio"}
+	exit := realMain()
+	if exit != 0 {
+		t.Fatalf("unexpected exit status %d; want 0", exit)
 	}
 }
 
@@ -255,3 +312,20 @@ func (c *testCommandCLI) Run(args []string) int {
 
 func (c *testCommandCLI) Synopsis() string { return "" }
 func (c *testCommandCLI) Help() string     { return "" }
+
+func TestWarnOutput(t *testing.T) {
+	mock := cli.NewMockUi()
+	wrapped := &ui{mock}
+	wrapped.Warn("WARNING")
+
+	stderr := mock.ErrorWriter.String()
+	stdout := mock.OutputWriter.String()
+
+	if stderr != "" {
+		t.Fatalf("unexpected stderr: %q", stderr)
+	}
+
+	if stdout != "WARNING\n" {
+		t.Fatalf("unexpected stdout: %q\n", stdout)
+	}
+}

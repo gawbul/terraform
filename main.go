@@ -1,144 +1,259 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"log"
+	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 
+	"github.com/apparentlymart/go-shquot/shquot"
+	"github.com/hashicorp/cli"
 	"github.com/hashicorp/go-plugin"
-	"github.com/hashicorp/terraform/helper/logging"
-	"github.com/hashicorp/terraform/terraform"
-	"github.com/mattn/go-colorable"
+	"github.com/hashicorp/terraform-svchost/disco"
+	"github.com/hashicorp/terraform/internal/addrs"
+	"github.com/hashicorp/terraform/internal/command/cliconfig"
+	"github.com/hashicorp/terraform/internal/command/format"
+	"github.com/hashicorp/terraform/internal/didyoumean"
+	"github.com/hashicorp/terraform/internal/httpclient"
+	"github.com/hashicorp/terraform/internal/logging"
+	"github.com/hashicorp/terraform/internal/terminal"
+	"github.com/hashicorp/terraform/version"
 	"github.com/mattn/go-shellwords"
-	"github.com/mitchellh/cli"
-	"github.com/mitchellh/panicwrap"
-	"github.com/mitchellh/prefixedio"
+	"github.com/mitchellh/colorstring"
+	"go.opentelemetry.io/otel/trace"
+
+	backendInit "github.com/hashicorp/terraform/internal/backend/init"
 )
 
 const (
 	// EnvCLI is the environment variable name to set additional CLI args.
 	EnvCLI = "TF_CLI_ARGS"
+
+	// The parent process will create a file to collect crash logs
+	envTmpLogPath = "TF_TEMP_LOG_PATH"
 )
 
+// ui wraps the primary output cli.Ui, and redirects Warn calls to Output
+// calls. This ensures that warnings are sent to stdout, and are properly
+// serialized within the stdout stream.
+type ui struct {
+	cli.Ui
+}
+
+func (u *ui) Warn(msg string) {
+	u.Ui.Output(msg)
+}
+
+func init() {
+	Ui = &ui{&cli.BasicUi{
+		Writer:      os.Stdout,
+		ErrorWriter: os.Stderr,
+		Reader:      os.Stdin,
+	}}
+}
+
 func main() {
-	// Override global prefix set by go-dynect during init()
-	log.SetPrefix("")
 	os.Exit(realMain())
 }
 
 func realMain() int {
-	var wrapConfig panicwrap.WrapConfig
+	defer logging.PanicHandler()
 
-	// don't re-exec terraform as a child process for easier debugging
-	if os.Getenv("TF_FORK") == "0" {
-		return wrappedMain()
+	var err error
+
+	err = openTelemetryInit()
+	if err != nil {
+		// openTelemetryInit can only fail if Terraform was run with an
+		// explicit environment variable to enable telemetry collection,
+		// so in typical use we cannot get here.
+		Ui.Error(fmt.Sprintf("Could not initialize telemetry: %s", err))
+		Ui.Error(fmt.Sprintf("Unset environment variable %s if you don't intend to collect telemetry from Terraform.", openTelemetryExporterEnvVar))
+		return 1
+	}
+	var ctx context.Context
+	var otelSpan trace.Span
+	{
+		// At minimum we emit a span covering the entire command execution.
+		_, displayArgs := shquot.POSIXShellSplit(os.Args)
+		ctx, otelSpan = tracer.Start(context.Background(), fmt.Sprintf("terraform %s", displayArgs))
+		defer otelSpan.End()
 	}
 
-	if !panicwrap.Wrapped(&wrapConfig) {
-		// Determine where logs should go in general (requested by the user)
-		logWriter, err := logging.LogOutput()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Couldn't setup log output: %s", err)
-			return 1
+	tmpLogPath := os.Getenv(envTmpLogPath)
+	if tmpLogPath != "" {
+		f, err := os.OpenFile(tmpLogPath, os.O_RDWR|os.O_APPEND, 0666)
+		if err == nil {
+			defer f.Close()
+
+			log.Printf("[DEBUG] Adding temp file log sink: %s", f.Name())
+			logging.RegisterSink(f)
+		} else {
+			log.Printf("[ERROR] Could not open temp log file: %v", err)
 		}
-
-		// We always send logs to a temporary file that we use in case
-		// there is a panic. Otherwise, we delete it.
-		logTempFile, err := ioutil.TempFile("", "terraform-log")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Couldn't setup logging tempfile: %s", err)
-			return 1
-		}
-		defer os.Remove(logTempFile.Name())
-		defer logTempFile.Close()
-
-		// Setup the prefixed readers that send data properly to
-		// stdout/stderr.
-		doneCh := make(chan struct{})
-		outR, outW := io.Pipe()
-		go copyOutput(outR, doneCh)
-
-		// Create the configuration for panicwrap and wrap our executable
-		wrapConfig.Handler = panicHandler(logTempFile)
-		wrapConfig.Writer = io.MultiWriter(logTempFile, logWriter)
-		wrapConfig.Stdout = outW
-		wrapConfig.IgnoreSignals = ignoreSignals
-		wrapConfig.ForwardSignals = forwardSignals
-		exitStatus, err := panicwrap.Wrap(&wrapConfig)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Couldn't start Terraform: %s", err)
-			return 1
-		}
-
-		// If >= 0, we're the parent, so just exit
-		if exitStatus >= 0 {
-			// Close the stdout writer so that our copy process can finish
-			outW.Close()
-
-			// Wait for the output copying to finish
-			<-doneCh
-
-			return exitStatus
-		}
-
-		// We're the child, so just close the tempfile we made in order to
-		// save file handles since the tempfile is only used by the parent.
-		logTempFile.Close()
 	}
 
-	// Call the real main
-	return wrappedMain()
-}
-
-func wrappedMain() int {
-	// We always need to close the DebugInfo before we exit.
-	defer terraform.CloseDebugInfo()
-
-	log.SetOutput(os.Stderr)
 	log.Printf(
-		"[INFO] Terraform version: %s %s %s",
-		Version, VersionPrerelease, GitCommit)
+		"[INFO] Terraform version: %s %s",
+		Version, VersionPrerelease)
+	for _, depMod := range version.InterestingDependencies() {
+		log.Printf("[DEBUG] using %s %s", depMod.Path, depMod.Version)
+	}
 	log.Printf("[INFO] Go runtime version: %s", runtime.Version())
 	log.Printf("[INFO] CLI args: %#v", os.Args)
-
-	// Load the configuration
-	config := BuiltinConfig
-	if err := config.Discover(Ui); err != nil {
-		Ui.Error(fmt.Sprintf("Error discovering plugins: %s", err))
-		return 1
+	if ExperimentsAllowed() {
+		log.Printf("[INFO] This build of Terraform allows using experimental features")
 	}
 
-	// Load the configuration file if we have one, that can be used to
-	// define extra providers and provisioners.
-	clicfgFile, err := cliConfigFile()
+	streams, err := terminal.Init()
 	if err != nil {
-		Ui.Error(fmt.Sprintf("Error loading CLI configuration: \n\n%s", err))
+		Ui.Error(fmt.Sprintf("Failed to configure the terminal: %s", err))
+		return 1
+	}
+	if streams.Stdout.IsTerminal() {
+		log.Printf("[TRACE] Stdout is a terminal of width %d", streams.Stdout.Columns())
+	} else {
+		log.Printf("[TRACE] Stdout is not a terminal")
+	}
+	if streams.Stderr.IsTerminal() {
+		log.Printf("[TRACE] Stderr is a terminal of width %d", streams.Stderr.Columns())
+	} else {
+		log.Printf("[TRACE] Stderr is not a terminal")
+	}
+	if streams.Stdin.IsTerminal() {
+		log.Printf("[TRACE] Stdin is a terminal")
+	} else {
+		log.Printf("[TRACE] Stdin is not a terminal")
+	}
+
+	// NOTE: We're intentionally calling LoadConfig _before_ handling a possible
+	// -chdir=... option on the command line, so that a possible relative
+	// path in the TERRAFORM_CONFIG_FILE environment variable (though probably
+	// ill-advised) will be resolved relative to the true working directory,
+	// not the overridden one.
+	config, diags := cliconfig.LoadConfig()
+
+	if len(diags) > 0 {
+		// Since we haven't instantiated a command.Meta yet, we need to do
+		// some things manually here and use some "safe" defaults for things
+		// that command.Meta could otherwise figure out in smarter ways.
+		Ui.Error("There are some problems with the CLI configuration:")
+		for _, diag := range diags {
+			earlyColor := &colorstring.Colorize{
+				Colors:  colorstring.DefaultColors,
+				Disable: true, // Disable color to be conservative until we know better
+				Reset:   true,
+			}
+			// We don't currently have access to the source code cache for
+			// the parser used to load the CLI config, so we can't show
+			// source code snippets in early diagnostics.
+			Ui.Error(format.Diagnostic(diag, nil, earlyColor, 78))
+		}
+		if diags.HasErrors() {
+			Ui.Error("As a result of the above problems, Terraform may not behave as intended.\n\n")
+			// We continue to run anyway, since Terraform has reasonable defaults.
+		}
+	}
+
+	// Get any configured credentials from the config and initialize
+	// a service discovery object. The slightly awkward predeclaration of
+	// disco is required to allow us to pass untyped nil as the creds source
+	// when creating the source fails. Otherwise we pass a typed nil which
+	// breaks the nil checks in the disco object
+	var services *disco.Disco
+	credsSrc, err := credentialsSource(config)
+	if err == nil {
+		services = disco.NewWithCredentialsSource(credsSrc)
+	} else {
+		// Most commands don't actually need credentials, and most situations
+		// that would get us here would already have been reported by the config
+		// loading above, so we'll just log this one as an aid to debugging
+		// in the unlikely event that it _does_ arise.
+		log.Printf("[WARN] Cannot initialize remote host credentials manager: %s", err)
+		// passing (untyped) nil as the creds source is okay because the disco
+		// object checks that and just acts as though no credentials are present.
+		services = disco.NewWithCredentialsSource(nil)
+	}
+	services.SetUserAgent(httpclient.TerraformUserAgent(version.String()))
+
+	providerSrc, diags := providerSource(config.ProviderInstallation, services)
+	if len(diags) > 0 {
+		Ui.Error("There are some problems with the provider_installation configuration:")
+		for _, diag := range diags {
+			earlyColor := &colorstring.Colorize{
+				Colors:  colorstring.DefaultColors,
+				Disable: true, // Disable color to be conservative until we know better
+				Reset:   true,
+			}
+			Ui.Error(format.Diagnostic(diag, nil, earlyColor, 78))
+		}
+		if diags.HasErrors() {
+			Ui.Error("As a result of the above problems, Terraform's provider installer may not behave as intended.\n\n")
+			// We continue to run anyway, because most commands don't do provider installation.
+		}
+	}
+	providerDevOverrides := providerDevOverrides(config.ProviderInstallation)
+
+	// The user can declare that certain providers are being managed on
+	// Terraform's behalf using this environment variable. This is used
+	// primarily by the SDK's acceptance testing framework.
+	unmanagedProviders, err := parseReattachProviders(os.Getenv("TF_REATTACH_PROVIDERS"))
+	if err != nil {
+		Ui.Error(err.Error())
 		return 1
 	}
 
-	if clicfgFile != "" {
-		usrcfg, err := LoadConfig(clicfgFile)
+	// Initialize the backends.
+	backendInit.Init(services)
+
+	// Get the command line args.
+	binName := filepath.Base(os.Args[0])
+	args := os.Args[1:]
+
+	originalWd, err := os.Getwd()
+	if err != nil {
+		// It would be very strange to end up here
+		Ui.Error(fmt.Sprintf("Failed to determine current working directory: %s", err))
+		return 1
+	}
+
+	// The arguments can begin with a -chdir option to ask Terraform to switch
+	// to a different working directory for the rest of its work. If that
+	// option is present then extractChdirOption returns a trimmed args with that option removed.
+	overrideWd, args, err := extractChdirOption(args)
+	if err != nil {
+		Ui.Error(fmt.Sprintf("Invalid -chdir option: %s", err))
+		return 1
+	}
+	if overrideWd != "" {
+		err := os.Chdir(overrideWd)
 		if err != nil {
-			Ui.Error(fmt.Sprintf("Error loading CLI configuration: \n\n%s", err))
+			Ui.Error(fmt.Sprintf("Error handling -chdir option: %s", err))
 			return 1
 		}
+	}
 
-		config = *config.Merge(usrcfg)
+	// In tests, Commands may already be set to provide mock commands
+	if Commands == nil {
+		// Commands get to hold on to the original working directory here,
+		// in case they need to refer back to it for any special reason, though
+		// they should primarily be working with the override working directory
+		// that we've now switched to above.
+		initCommands(ctx, originalWd, streams, config, services, providerSrc, providerDevOverrides, unmanagedProviders)
 	}
 
 	// Run checkpoint
-	go runCheckpoint(&config)
+	go runCheckpoint(ctx, config)
 
 	// Make sure we clean up any managed plugins at the end of this
 	defer plugin.CleanupClients()
-
-	// Get the command line args.
-	args := os.Args[1:]
 
 	// Build the CLI so far, we do this so we can query the subcommand.
 	cliRunner := &cli.CLI{
@@ -179,15 +294,47 @@ func wrappedMain() int {
 	// Rebuild the CLI with any modified args.
 	log.Printf("[INFO] CLI command args: %#v", args)
 	cliRunner = &cli.CLI{
+		Name:       binName,
 		Args:       args,
 		Commands:   Commands,
 		HelpFunc:   helpFunc,
 		HelpWriter: os.Stdout,
+
+		Autocomplete:          true,
+		AutocompleteInstall:   "install-autocomplete",
+		AutocompleteUninstall: "uninstall-autocomplete",
 	}
 
-	// Initialize the TFConfig settings for the commands...
-	ContextOpts.Providers = config.ProviderFactories()
-	ContextOpts.Provisioners = config.ProvisionerFactories()
+	// Before we continue we'll check whether the requested command is
+	// actually known. If not, we might be able to suggest an alternative
+	// if it seems like the user made a typo.
+	// (This bypasses the built-in help handling in cli.CLI for the situation
+	// where a command isn't found, because it's likely more helpful to
+	// mention what specifically went wrong, rather than just printing out
+	// a big block of usage information.)
+
+	// Check if this is being run via shell auto-complete, which uses the
+	// binary name as the first argument and won't be listed as a subcommand.
+	autoComplete := os.Getenv("COMP_LINE") != ""
+
+	if cmd := cliRunner.Subcommand(); cmd != "" && !autoComplete {
+		// Due to the design of cli.CLI, this special error message only works
+		// for typos of top-level commands. For a subcommand typo, like
+		// "terraform state posh", cmd would be "state" here and thus would
+		// be considered to exist, and it would print out its own usage message.
+		if _, exists := Commands[cmd]; !exists {
+			suggestions := make([]string, 0, len(Commands))
+			for name := range Commands {
+				suggestions = append(suggestions, name)
+			}
+			suggestion := didyoumean.NameSuggestion(cmd, suggestions)
+			if suggestion != "" {
+				suggestion = fmt.Sprintf(" Did you mean %q?", suggestion)
+			}
+			fmt.Fprintf(os.Stderr, "Terraform has no command named %q.%s\n\nTo see all of Terraform's top-level commands, run:\n  terraform -help\n\n", cmd, suggestion)
+			return 1
+		}
+	}
 
 	exitCode, err := cliRunner.Run()
 	if err != nil {
@@ -195,87 +342,15 @@ func wrappedMain() int {
 		return 1
 	}
 
-	return exitCode
-}
-
-func cliConfigFile() (string, error) {
-	mustExist := true
-	configFilePath := os.Getenv("TERRAFORM_CONFIG")
-	if configFilePath == "" {
-		var err error
-		configFilePath, err = ConfigFile()
-		mustExist = false
-
-		if err != nil {
-			log.Printf(
-				"[ERROR] Error detecting default CLI config file path: %s",
-				err)
+	// if we are exiting with a non-zero code, check if it was caused by any
+	// plugins crashing
+	if exitCode != 0 {
+		for _, panicLog := range logging.PluginPanics() {
+			Ui.Error(panicLog)
 		}
 	}
 
-	log.Printf("[DEBUG] Attempting to open CLI config file: %s", configFilePath)
-	f, err := os.Open(configFilePath)
-	if err == nil {
-		f.Close()
-		return configFilePath, nil
-	}
-
-	if mustExist || !os.IsNotExist(err) {
-		return "", err
-	}
-
-	log.Println("[DEBUG] File doesn't exist, but doesn't need to. Ignoring.")
-	return "", nil
-}
-
-// copyOutput uses output prefixes to determine whether data on stdout
-// should go to stdout or stderr. This is due to panicwrap using stderr
-// as the log and error channel.
-func copyOutput(r io.Reader, doneCh chan<- struct{}) {
-	defer close(doneCh)
-
-	pr, err := prefixedio.NewReader(r)
-	if err != nil {
-		panic(err)
-	}
-
-	stderrR, err := pr.Prefix(ErrorPrefix)
-	if err != nil {
-		panic(err)
-	}
-	stdoutR, err := pr.Prefix(OutputPrefix)
-	if err != nil {
-		panic(err)
-	}
-	defaultR, err := pr.Prefix("")
-	if err != nil {
-		panic(err)
-	}
-
-	var stdout io.Writer = os.Stdout
-	var stderr io.Writer = os.Stderr
-
-	if runtime.GOOS == "windows" {
-		stdout = colorable.NewColorableStdout()
-		stderr = colorable.NewColorableStderr()
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(3)
-	go func() {
-		defer wg.Done()
-		io.Copy(stderr, stderrR)
-	}()
-	go func() {
-		defer wg.Done()
-		io.Copy(stdout, stdoutR)
-	}()
-	go func() {
-		defer wg.Done()
-		io.Copy(stdout, defaultR)
-	}()
-
-	wg.Wait()
+	return exitCode
 }
 
 func mergeEnvArgs(envName string, cmd string, args []string) ([]string, error) {
@@ -284,8 +359,13 @@ func mergeEnvArgs(envName string, cmd string, args []string) ([]string, error) {
 		return args, nil
 	}
 
+	swParser := &shellwords.Parser{
+		ParseEnv:      false,
+		ParseBacktick: false,
+	}
+
 	log.Printf("[INFO] %s value: %q", envName, v)
-	extra, err := shellwords.Parse(v)
+	extra, err := swParser.Parse(v)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"Error parsing extra CLI args from %s: %s",
@@ -320,4 +400,102 @@ func mergeEnvArgs(envName string, cmd string, args []string) ([]string, error) {
 	copy(newArgs[idx:], extra)
 	copy(newArgs[len(extra)+idx:], args[idx:])
 	return newArgs, nil
+}
+
+// parse information on reattaching to unmanaged providers out of a
+// JSON-encoded environment variable.
+func parseReattachProviders(in string) (map[addrs.Provider]*plugin.ReattachConfig, error) {
+	unmanagedProviders := map[addrs.Provider]*plugin.ReattachConfig{}
+	if in != "" {
+		type reattachConfig struct {
+			Protocol        string
+			ProtocolVersion int
+			Addr            struct {
+				Network string
+				String  string
+			}
+			Pid  int
+			Test bool
+		}
+		var m map[string]reattachConfig
+		err := json.Unmarshal([]byte(in), &m)
+		if err != nil {
+			return unmanagedProviders, fmt.Errorf("Invalid format for TF_REATTACH_PROVIDERS: %w", err)
+		}
+		for p, c := range m {
+			a, diags := addrs.ParseProviderSourceString(p)
+			if diags.HasErrors() {
+				return unmanagedProviders, fmt.Errorf("Error parsing %q as a provider address: %w", a, diags.Err())
+			}
+			var addr net.Addr
+			switch c.Addr.Network {
+			case "unix":
+				addr, err = net.ResolveUnixAddr("unix", c.Addr.String)
+				if err != nil {
+					return unmanagedProviders, fmt.Errorf("Invalid unix socket path %q for %q: %w", c.Addr.String, p, err)
+				}
+			case "tcp":
+				addr, err = net.ResolveTCPAddr("tcp", c.Addr.String)
+				if err != nil {
+					return unmanagedProviders, fmt.Errorf("Invalid TCP address %q for %q: %w", c.Addr.String, p, err)
+				}
+			default:
+				return unmanagedProviders, fmt.Errorf("Unknown address type %q for %q", c.Addr.Network, p)
+			}
+			unmanagedProviders[a] = &plugin.ReattachConfig{
+				Protocol:        plugin.Protocol(c.Protocol),
+				ProtocolVersion: c.ProtocolVersion,
+				Pid:             c.Pid,
+				Test:            c.Test,
+				Addr:            addr,
+			}
+		}
+	}
+	return unmanagedProviders, nil
+}
+
+func extractChdirOption(args []string) (string, []string, error) {
+	if len(args) == 0 {
+		return "", args, nil
+	}
+
+	const argName = "-chdir"
+	const argPrefix = argName + "="
+	var argValue string
+	var argPos int
+
+	for i, arg := range args {
+		if !strings.HasPrefix(arg, "-") {
+			// Because the chdir option is a subcommand-agnostic one, we require
+			// it to appear before any subcommand argument, so if we find a
+			// non-option before we find -chdir then we are finished.
+			break
+		}
+		if arg == argName || arg == argPrefix {
+			return "", args, fmt.Errorf("must include an equals sign followed by a directory path, like -chdir=example")
+		}
+		if strings.HasPrefix(arg, argPrefix) {
+			argPos = i
+			argValue = arg[len(argPrefix):]
+		}
+	}
+
+	// When we fall out here, we'll have populated argValue with a non-empty
+	// string if the -chdir=... option was present and valid, or left it
+	// empty if it wasn't present.
+	if argValue == "" {
+		return "", args, nil
+	}
+
+	// If we did find the option then we'll need to produce a new args that
+	// doesn't include it anymore.
+	if argPos == 0 {
+		// Easy case: we can just slice off the front
+		return argValue, args[1:], nil
+	}
+	// Otherwise we need to construct a new array and copy to it.
+	newArgs := make([]string, len(args)-1)
+	copy(newArgs, args[:argPos])
+	copy(newArgs[argPos:], args[argPos+1:])
+	return argValue, newArgs, nil
 }

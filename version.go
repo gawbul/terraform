@@ -1,9 +1,12 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package main
 
-import "github.com/hashicorp/terraform/terraform"
+import (
+	"github.com/hashicorp/terraform/version"
+)
 
-// The git commit that was compiled. This will be filled in by the compiler.
-var GitCommit string
+var Version = version.Version
 
-const Version = terraform.Version
-const VersionPrerelease = terraform.VersionPrerelease
+var VersionPrerelease = version.Prerelease
